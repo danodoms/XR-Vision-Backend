@@ -1,3 +1,15 @@
+# RUN WITH THIS COMMAND LOCALLY
+# RUN WITH THIS COMMAND LOCALLY
+# RUN WITH THIS COMMAND LOCALLY
+
+# uvicorn app:app --host 0.0.0.0 --port 8000
+# uvicorn app:app --host 0.0.0.0 --port 8000
+# uvicorn app:app --host 0.0.0.0 --port 8000
+# uvicorn app:app --host 0.0.0.0 --port 8000
+# uvicorn app:app --host 0.0.0.0 --port 8000
+# uvicorn app:app --host 0.0.0.0 --port 8000
+
+
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from tensorflow.keras.applications import VGG16
@@ -88,13 +100,13 @@ async def generate_heatmap(file: UploadFile = File(...)):
         output = cam.overlay_heatmap(heatmap, orig, alpha=0.5)
 
         # Convert the output image to bytes
-        _, output_image = cv2.imencode(".png", output)
+        _, output_image = cv2.imencode(".jpg", output)
         image_bytes = io.BytesIO(output_image.tobytes())
 
         # Return the heatmap image and prediction details
         return StreamingResponse(
             image_bytes,
-            media_type="image/png",
+            media_type="image/jpeg",
             headers={"Prediction-Label": label, "Prediction-Confidence": str(prob)}
         )
 
