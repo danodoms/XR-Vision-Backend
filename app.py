@@ -9,25 +9,34 @@
 # uvicorn app:app --host 0.0.0.0 --port 8000
 # uvicorn app:app --host 0.0.0.0 --port 8000
 
-
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
-from tensorflow.keras.applications import VGG16
-from tensorflow.keras.applications import imagenet_utils
+from tensorflow.keras.models import load_model, Model
 from tensorflow.keras.preprocessing.image import img_to_array
-from tensorflow.keras.preprocessing.image import load_img
-from tensorflow.keras.models import Model
 import tensorflow as tf
 import numpy as np
 import cv2
 import io
 from PIL import Image
+import traceback
+
+# FORCE TO USE CPU
+tf.config.set_visible_devices([], 'GPU')
+
 
 # Initialize the FastAPI app
 app = FastAPI()
 
-# Load the pre-trained model
-model = VGG16(weights="imagenet")
+# Load your custom Keras model once during app startup (global model)
+model_path = "./model/npk-classifier-v2-functional.keras"  # Path to your saved model
+model = load_model(model_path)
+
+# List of class labels for your model (replace with your actual class labels)
+CLASS_LABELS = ["Healthy", "Nitrogen Deficient", "Phosphorus Deficient", "Potassium Deficient"]
+
+# Clear GPU memory after each request
+def clear_gpu_memory():
+    tf.keras.backend.clear_session()
 
 class GradCAM:
     def __init__(self, model, classIdx, layerName=None):
@@ -71,8 +80,9 @@ class GradCAM:
         output = cv2.addWeighted(image, alpha, heatmap, 1 - alpha, 0)
         return output
 
+
 @app.post("/generate-heatmap/")
-async def generate_heatmap(file: UploadFile = File(...)):
+async def generate_heatmap(file: UploadFile = File(...), enable_gradcam: bool = True, background_tasks: BackgroundTasks = None):
     try:
         # Read the uploaded image
         contents = await file.read()
@@ -80,28 +90,35 @@ async def generate_heatmap(file: UploadFile = File(...)):
         orig = np.array(pil_image)
 
         # Preprocess the image for the model
-        image = pil_image.resize((224, 224))
+        image = pil_image.resize((224, 224)) 
         image = img_to_array(image)
-        image = np.expand_dims(image, axis=0)
-        image = imagenet_utils.preprocess_input(image)
+        image = np.expand_dims(image, axis=0)  # Add batch dimension
 
         # Make predictions
         preds = model.predict(image)
         classIdx = np.argmax(preds[0])
-        decoded = imagenet_utils.decode_predictions(preds)
-        (imagenetID, label, prob) = decoded[0][0]
+        label = CLASS_LABELS[classIdx]
+        prob = float(preds[0][classIdx])
 
-        # Generate Grad-CAM heatmap
-        cam = GradCAM(model, classIdx)
-        heatmap = cam.compute_heatmap(image)
+        # Initialize GradCAM only if enabled
+        if enable_gradcam:
+            cam = GradCAM(model, classIdx)
+            print(f"Using layer: {cam.layerName}")  # Debug print
+            heatmap = cam.compute_heatmap(image)
 
-        # Resize heatmap to original image size and overlay
-        heatmap = cv2.resize(heatmap, (orig.shape[1], orig.shape[0]))
-        output = cam.overlay_heatmap(heatmap, orig, alpha=0.5)
+            # Resize heatmap to original image size and overlay
+            heatmap = cv2.resize(heatmap, (orig.shape[1], orig.shape[0]))
+            output = cam.overlay_heatmap(heatmap, orig, alpha=0.5)
+        else:
+            output = orig  # Just return the original image if GradCAM is disabled
 
         # Convert the output image to bytes
         _, output_image = cv2.imencode(".jpg", output)
         image_bytes = io.BytesIO(output_image.tobytes())
+
+        # Clear GPU memory after the request
+        if background_tasks:
+            background_tasks.add_task(clear_gpu_memory)
 
         # Return the heatmap image and prediction details
         return StreamingResponse(
@@ -111,4 +128,13 @@ async def generate_heatmap(file: UploadFile = File(...)):
         )
 
     except Exception as e:
-        return JSONResponse(status_code=500, content={"message": str(e)})
+        # Log the exception with traceback
+        error_traceback = traceback.format_exc()
+        print(model.summary())
+        print(error_traceback)  # Logs to the console
+
+        # Return the traceback in the response (useful for debugging)
+        return JSONResponse(
+            status_code=500, 
+            content={"message": str(e), "traceback": error_traceback}
+        )
