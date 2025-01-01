@@ -1,140 +1,129 @@
-# RUN WITH THIS COMMAND LOCALLY
-# RUN WITH THIS COMMAND LOCALLY
-# RUN WITH THIS COMMAND LOCALLY
-
-# uvicorn app:app --host 0.0.0.0 --port 8000
-# uvicorn app:app --host 0.0.0.0 --port 8000
-# uvicorn app:app --host 0.0.0.0 --port 8000
-# uvicorn app:app --host 0.0.0.0 --port 8000
-# uvicorn app:app --host 0.0.0.0 --port 8000
-# uvicorn app:app --host 0.0.0.0 --port 8000
-
-from fastapi import FastAPI, File, UploadFile, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-from tensorflow.keras.models import load_model, Model
-from tensorflow.keras.preprocessing.image import img_to_array
+from tensorflow.keras.models import load_model
 import tensorflow as tf
 import numpy as np
 import cv2
 import io
 from PIL import Image
-import traceback
+from typing import Tuple
+from functools import lru_cache
 
-# FORCE TO USE CPU
+# Force CPU usage and optimize TF for CPU
 tf.config.set_visible_devices([], 'GPU')
+# tf.config.threading.set_intra_op_parallelism_threads(4)
+# tf.config.threading.set_inter_op_parallelism_threads(2)
 
-
-# Initialize the FastAPI app
 app = FastAPI()
 
-# Load your custom Keras model once during app startup (global model)
-model_path = "./model/npk-classifier-v2-functional.keras"  # Path to your saved model
-model = load_model(model_path)
-
-# List of class labels for your model (replace with your actual class labels)
+# Constants
+MODEL_PATH = "./model/npk-classifier-v2-functional.keras"
+STANDARD_SIZE = (224, 224)
+PERFORMANCE_SIZE = (128, 128)
 CLASS_LABELS = ["Healthy", "Nitrogen Deficient", "Phosphorus Deficient", "Potassium Deficient"]
 
-# Clear GPU memory after each request
-def clear_gpu_memory():
-    tf.keras.backend.clear_session()
+@lru_cache(maxsize=1)
+def get_model():
+    model = load_model(MODEL_PATH)
+    return model
 
 class GradCAM:
-    def __init__(self, model, classIdx, layerName=None):
+    def __init__(self, model: tf.keras.Model, class_idx: int):
         self.model = model
-        self.classIdx = classIdx
-        self.layerName = layerName or self.find_target_layer()
-
-    def find_target_layer(self):
-        for layer in reversed(self.model.layers):
-            if len(layer.output.shape) == 4:
-                return layer.name
-        raise ValueError("Could not find 4D layer. Cannot apply GradCAM.")
-
-    def compute_heatmap(self, image, eps=1e-8):
-        gradModel = Model(inputs=[self.model.inputs], outputs=[self.model.get_layer(self.layerName).output, self.model.output])
+        self.class_idx = class_idx
+        self.layer_name = next(layer.name for layer in reversed(self.model.layers) 
+                             if len(layer.output.shape) == 4)
+        
+    def compute_heatmap(self, image: np.ndarray) -> np.ndarray:
+        grad_model = tf.keras.Model(
+            inputs=[self.model.inputs],
+            outputs=[
+                self.model.get_layer(self.layer_name).output,
+                self.model.output
+            ]
+        )
+        
         with tf.GradientTape() as tape:
-            inputs = tf.cast(image, tf.float32)
-            (convOutputs, predictions) = gradModel(inputs)
-            loss = predictions[:, self.classIdx]
+            conv_outputs, predictions = grad_model(image)
+            loss = predictions[:, self.class_idx]
+        
+        grads = tape.gradient(loss, conv_outputs)
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+        
+        heatmap = tf.reduce_sum(tf.multiply(pooled_grads, conv_outputs[0]), axis=-1)
+        
+        heatmap = np.maximum(heatmap, 0) / (np.max(heatmap) + 1e-10)
+        return np.uint8(255 * heatmap)
 
-        grads = tape.gradient(loss, convOutputs)
-        castConvOutputs = tf.cast(convOutputs > 0, "float32")
-        castGrads = tf.cast(grads > 0, "float32")
-        guidedGrads = castConvOutputs * castGrads * grads
+    @staticmethod
+    def overlay_heatmap(heatmap: np.ndarray, image: np.ndarray) -> np.ndarray:
+        heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+        return cv2.addWeighted(image, 0.5, heatmap, 0.5, 0)
 
-        convOutputs = convOutputs[0]
-        guidedGrads = guidedGrads[0]
-        weights = tf.reduce_mean(guidedGrads, axis=(0, 1))
-        cam = tf.reduce_sum(tf.multiply(weights, convOutputs), axis=-1)
-
-        (w, h) = (image.shape[2], image.shape[1])
-        heatmap = cv2.resize(cam.numpy(), (w, h))
-        numer = heatmap - np.min(heatmap)
-        denom = (heatmap.max() - heatmap.min()) + eps
-        heatmap = numer / denom
-        heatmap = (heatmap * 255).astype("uint8")
-        return heatmap
-
-    def overlay_heatmap(self, heatmap, image, alpha=0.5, colormap=cv2.COLORMAP_JET):
-        heatmap = cv2.applyColorMap(heatmap, colormap)
-        output = cv2.addWeighted(image, alpha, heatmap, 1 - alpha, 0)
-        return output
-
+def preprocess_image(image_data: bytes, performance_mode: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+    # Read image directly into numpy array
+    nparr = np.frombuffer(image_data, np.uint8)
+    orig_image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    
+    # Choose size based on performance mode
+    target_size = PERFORMANCE_SIZE if performance_mode else STANDARD_SIZE
+    
+    # For performance mode, resize the original image first to reduce memory usage
+    if performance_mode:
+        orig_image = cv2.resize(orig_image, PERFORMANCE_SIZE)
+    
+    # Resize efficiently using cv2
+    input_image = cv2.resize(orig_image, target_size)
+    input_image = np.expand_dims(input_image, 0)
+    
+    return input_image, orig_image
 
 @app.post("/generate-heatmap/")
-async def generate_heatmap(file: UploadFile = File(...), enable_gradcam: bool = True, background_tasks: BackgroundTasks = None):
+async def generate_heatmap(
+    file: UploadFile = File(...),
+    enable_gradcam: bool = True,
+    performance_mode: bool = False
+) -> StreamingResponse:
     try:
-        # Read the uploaded image
+        # Read file content
         contents = await file.read()
-        pil_image = Image.open(io.BytesIO(contents))
-        orig = np.array(pil_image)
-
-        # Preprocess the image for the model
-        image = pil_image.resize((224, 224)) 
-        image = img_to_array(image)
-        image = np.expand_dims(image, axis=0)  # Add batch dimension
-
-        # Make predictions
-        preds = model.predict(image)
-        classIdx = np.argmax(preds[0])
-        label = CLASS_LABELS[classIdx]
-        prob = float(preds[0][classIdx])
-
-        # Initialize GradCAM only if enabled
+        
+        # Process image efficiently with performance mode option
+        input_image, orig_image = preprocess_image(contents, performance_mode)
+        
+        # Get cached model and make prediction
+        model = get_model()
+        preds = model(input_image, training=False)
+        class_idx = int(tf.argmax(preds[0]))
+        probability = float(preds[0][class_idx])
+        
+        # Generate heatmap if needed
         if enable_gradcam:
-            cam = GradCAM(model, classIdx)
-            print(f"Using layer: {cam.layerName}")  # Debug print
-            heatmap = cam.compute_heatmap(image)
-
-            # Resize heatmap to original image size and overlay
-            heatmap = cv2.resize(heatmap, (orig.shape[1], orig.shape[0]))
-            output = cam.overlay_heatmap(heatmap, orig, alpha=0.5)
+            cam = GradCAM(model, class_idx)
+            heatmap = cam.compute_heatmap(input_image)
+            heatmap = cv2.resize(heatmap, (orig_image.shape[1], orig_image.shape[0]))
+            output = cam.overlay_heatmap(heatmap, orig_image)
         else:
-            output = orig  # Just return the original image if GradCAM is disabled
+            output = orig_image
 
-        # Convert the output image to bytes
-        _, output_image = cv2.imencode(".jpg", output)
-        image_bytes = io.BytesIO(output_image.tobytes())
-
-        # Clear GPU memory after the request
-        if background_tasks:
-            background_tasks.add_task(clear_gpu_memory)
-
-        # Return the heatmap image and prediction details
+        # Encode output efficiently
+        # Use higher compression in performance mode
+        quality = 80 if performance_mode else 90
+        _, buffer = cv2.imencode('.jpg', output, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        
         return StreamingResponse(
-            image_bytes,
+            io.BytesIO(buffer.tobytes()),
             media_type="image/jpeg",
-            headers={"Prediction-Label": label, "Prediction-Confidence": str(prob)}
+            headers={
+                "Prediction-Label": CLASS_LABELS[class_idx],
+                "Prediction-Confidence": str(probability),
+                "Performance-Mode": str(performance_mode)
+            }
         )
 
     except Exception as e:
-        # Log the exception with traceback
-        error_traceback = traceback.format_exc()
-        print(model.summary())
-        print(error_traceback)  # Logs to the console
+        raise HTTPException(status_code=500, detail=str(e))
 
-        # Return the traceback in the response (useful for debugging)
-        return JSONResponse(
-            status_code=500, 
-            content={"message": str(e), "traceback": error_traceback}
-        )
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
