@@ -28,11 +28,11 @@ tf.config.set_visible_devices([], 'GPU')
 app = FastAPI()
 
 # Load your custom Keras model once during app startup (global model)
-model_path = "./model/npk-classifier-v2-functional.keras"  # Path to your saved model
+model_path = "./model/melon-disease-v3-224.keras"  # Path to your saved model
 model = load_model(model_path)
 
 # List of class labels for your model (replace with your actual class labels)
-CLASS_LABELS = ["Healthy", "Nitrogen Deficient", "Phosphorus Deficient", "Potassium Deficient"]
+CLASS_LABELS = ["Anthracnose", "Downy Mildew", "Healthy", "Mosaic Virus"]
 
 # Clear GPU memory after each request
 def clear_gpu_memory():
